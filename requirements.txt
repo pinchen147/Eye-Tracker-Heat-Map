@@ -1,0 +1,9 @@
+eyeGestures
+numpy
+opencv-python
+mediapipe
+scikit-learn
+pyobjc
+pyobjc-framework-Quartz
+pygame
+flask
