@@ -1,8 +1,7 @@
 #!/usr/bin/env python3
 """
-Lightweight Eye Tracking Service
-- Standalone or Electron-integratable via HTTP API
-- Features: calibration phase, gaze tracking with visual trail/dot, camera selection
+Lightweight eye-tracking service with optional HTTP API for Electron or standalone use.
+Includes calibration flow, gaze trail/dot visuals, and camera switching.
 """
 
 import sys
@@ -51,7 +50,7 @@ class GazeTracker:
     
     def get_available_cameras(self) -> list:
         available = []
-        for i in range(3):  # Check first 3 indices
+        for i in range(3):  # Probe first three indices
             cap = cv2.VideoCapture(i)
             if cap.isOpened():
                 available.append(i)
@@ -84,7 +83,7 @@ class GazeTracker:
         self.gestures = EyeGestures_v3()
         self.cap = VideoCapture(self.camera_index)
         
-        # Setup calibration map - 4x3 grid (12 points, use 10)
+        # 4x3 calibration grid (use 10 points)
         x = np.array([0.15, 0.5, 0.85])
         y = np.array([0.15, 0.5, 0.85])
         xx, yy = np.meshgrid(x, y)
@@ -142,7 +141,7 @@ class GazeTracker:
             screen.fill((20, 20, 25))
             
             if gaze_event is None:
-                # Show "looking for face" message
+                # Show face prompt
                 text = font.render("Looking for face... Position yourself in front of camera", True, (200, 150, 100))
                 screen.blit(text, (self.screen_width // 2 - 250, self.screen_height // 2))
                 pygame.display.flip()
@@ -150,45 +149,45 @@ class GazeTracker:
                 continue
             
             if calibrate:
-                # Calibration phase
+                # Calibration mode
                 if calib_event:
                     px, py = int(calib_event.point[0]), int(calib_event.point[1])
                     if px != self.prev_calib_point[0] or py != self.prev_calib_point[1]:
                         self.calibration_count += 1
                         self.prev_calib_point = (px, py)
                     
-                    # Draw calibration target
+                    # Render calibration target
                     pygame.draw.circle(screen, (60, 60, 80), (px, py), calib_event.acceptance_radius + 20)
                     pygame.draw.circle(screen, (100, 50, 255), (px, py), calib_event.acceptance_radius)
                     pygame.draw.circle(screen, (255, 255, 255), (px, py), 8)
                     
-                    # Progress text
+                    # Progress label
                     text = bold_font.render(f"{self.calibration_count}/{self.calibration_points}", True, (255, 255, 255))
                     text_rect = text.get_rect(center=(px, py - calib_event.acceptance_radius - 40))
                     screen.blit(text, text_rect)
                     
-                    # Instructions
+                    # Instruction copy
                     inst = font.render("Look at the circle until it moves", True, (150, 150, 150))
                     screen.blit(inst, (self.screen_width // 2 - 150, 50))
             else:
-                # Tracking phase
+                # Tracking mode
                 self.calibrating = False
                 x, y = int(gaze_event.point[0]), int(gaze_event.point[1])
                 
-                # Add to trail
+                # Append to trail
                 self.trail.append((x, y, gaze_event.fixation))
                 
-                # Draw trail
+                # Render trail
                 for i, (tx, ty, fix) in enumerate(self.trail):
                     alpha = int((i / len(self.trail)) * 200)
                     radius = int((i / len(self.trail)) * 15) + 3
                     if fix:
-                        color = (alpha, 50, 50)  # Red trail for fixation
+                        color = (alpha, 50, 50)  # Red trail when fixating
                     else:
                         color = (50, alpha, 50)  # Green trail for movement
                     pygame.draw.circle(screen, color, (tx, ty), radius)
                 
-                # Draw main gaze dot
+                # Render gaze dot
                 if gaze_event.fixation:
                     pygame.draw.circle(screen, (255, 80, 80), (x, y), 25)
                     pygame.draw.circle(screen, (255, 200, 200), (x, y), 12)

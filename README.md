@@ -31,3 +31,6 @@ python gaze_tracker.py [--camera 0] [--trail 30] [--api-port 5000]
 ## Notes
 - EyeGestures is fetched from PyPI: https://github.com/NativeSensors/EyeGestures
 - If the EyeGestures install ever skips heavy deps (mediapipe, opencv, scikit-learn), re-run `pip install -r requirements.txt`.
+
+## License
+MIT License – see `LICENSE` for details.
