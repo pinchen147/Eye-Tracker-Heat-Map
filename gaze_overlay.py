@@ -1,54 +1,63 @@
 #!/usr/bin/env python3
-"""Click-through macOS gaze overlay with heatmap."""
+"""Transparent click-through gaze overlay with heatmap for macOS."""
 
 import math
+import os
 import signal
 import sys
-import os
 import threading
 import time
 from collections import deque
 from dataclasses import dataclass
-from typing import Optional, List, Tuple
-import numpy as np
+from typing import List, Optional, Tuple
+
 import cv2
-
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'EyeGestures'))
-from eyeGestures.utils import VideoCapture
-from eyeGestures import EyeGestures_v3
-
+import numpy as np
+import objc
 import Quartz
 from AppKit import (
-    NSApplication, NSApp, NSWindow, NSView, NSColor, NSScreen,
-    NSBorderlessWindowMask, NSBackingStoreBuffered,
-    NSApplicationActivationPolicyAccessory, NSGraphicsContext
+    NSApplication,
+    NSBackingStoreBuffered,
+    NSBorderlessWindowMask,
+    NSColor,
+    NSGraphicsContext,
+    NSScreen,
+    NSView,
+    NSWindow,
+    NSApplicationActivationPolicyAccessory,
 )
 from Foundation import NSObject, NSTimer
 from PyObjCTools import AppHelper
-import objc
 
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'EyeGestures'))
+from eyeGestures import EyeGestures_v3
+from eyeGestures.utils import VideoCapture
 
-# Configuration
-CALIBRATION_POINTS = 9  # 3x3 grid
+# Calibration
+CALIBRATION_POINTS = 9
 CALIBRATION_GRID = [0.15, 0.5, 0.85]
-SAMPLES_PER_POINT = 6  # ~54 samples total
+SAMPLES_PER_POINT = 10
+
+# Heatmap
 HEATMAP_DECAY = 0.99
 HEATMAP_KERNEL_SIZE = 81
 HEATMAP_SIGMA = 30
 PEAK_MIN_DISTANCE = 100
 PEAK_THRESHOLD = 0.15
+
+# Visualization
 TRAIL_MAX_AGE = 0.4
 TRAIL_MAX_LENGTH = 20
 FPS = 60
 
-# Custom smoothing; bypass library smoothing
-EMA_ALPHA = 0.15  # Lower = stronger smoothing
-VELOCITY_THRESHOLD = 300  # Clamp large jumps
-LOST_TRACKING_FRAMES = 45  # Grace frames before drop
-MIN_DETECTION_CONFIDENCE = 0.3  # Looser detection for distance
+# Smoothing
+EMA_ALPHA = 0.15
+VELOCITY_THRESHOLD = 300
+LOST_TRACKING_FRAMES = 45
+MIN_DETECTION_CONFIDENCE = 0.3
 MIN_TRACKING_CONFIDENCE = 0.3
 
-# Globals for cleanup and recalibration
+# Globals
 _app_delegate = None
 _recalibrate_requested = False
 
@@ -61,20 +70,19 @@ class GazeSmoother:
         self.velocity_thresh = velocity_thresh
         self.x: Optional[float] = None
         self.y: Optional[float] = None
-        self.vx: float = 0.0  # Momentum velocity
+        self.vx: float = 0.0
         self.vy: float = 0.0
         self.lost_frames = 0
-        self.history: deque = deque(maxlen=5)  # Median buffer
+        self.history: deque = deque(maxlen=5)
     
     def update(self, raw_x: float, raw_y: float) -> Tuple[int, int]:
-        """Run smoothing pipeline."""
-        # Median filter to drop spikes
+        """Apply multi-stage smoothing: median -> velocity clamp -> EMA."""
         self.history.append((raw_x, raw_y))
+        
         if len(self.history) >= 3:
-            xs = sorted([p[0] for p in self.history])
-            ys = sorted([p[1] for p in self.history])
-            median_x = xs[len(xs) // 2]
-            median_y = ys[len(ys) // 2]
+            xs = sorted(p[0] for p in self.history)
+            ys = sorted(p[1] for p in self.history)
+            median_x, median_y = xs[len(xs) // 2], ys[len(ys) // 2]
         else:
             median_x, median_y = raw_x, raw_y
         
@@ -83,24 +91,16 @@ class GazeSmoother:
             self.lost_frames = 0
             return (int(median_x), int(median_y))
         
-        # Velocity gate for outliers
-        dx = median_x - self.x
-        dy = median_y - self.y
+        dx, dy = median_x - self.x, median_y - self.y
         velocity = (dx**2 + dy**2) ** 0.5
         
-        # Clamp step size to prevent leaps
         if velocity > self.velocity_thresh:
-            # Scale step down
-            scale = self.velocity_thresh / velocity
-            dx *= scale * 0.3  # Extra damping on clamped steps
-            dy *= scale * 0.3
-            median_x = self.x + dx
-            median_y = self.y + dy
+            scale = self.velocity_thresh / velocity * 0.3
+            dx, dy = dx * scale, dy * scale
+            median_x, median_y = self.x + dx, self.y + dy
         
-        # EMA plus momentum
         self.vx = self.alpha * (median_x - self.x) + (1 - self.alpha) * self.vx * 0.5
         self.vy = self.alpha * (median_y - self.y) + (1 - self.alpha) * self.vy * 0.5
-        
         self.x += self.vx
         self.y += self.vy
         self.lost_frames = 0
@@ -108,18 +108,16 @@ class GazeSmoother:
         return (int(self.x), int(self.y))
     
     def mark_lost(self) -> Optional[Tuple[int, int]]:
-        """Handle lost frames; return last point if still recent."""
+        """Handle lost tracking. Returns last position or None after timeout."""
         self.lost_frames += 1
-        # Fade velocity while lost
         self.vx *= 0.8
         self.vy *= 0.8
         if self.lost_frames > LOST_TRACKING_FRAMES:
             return None
-        if self.x is not None:
-            return (int(self.x), int(self.y))
-        return None
+        return (int(self.x), int(self.y)) if self.x is not None else None
     
     def reset(self):
+        """Reset smoother state."""
         self.x = self.y = None
         self.vx = self.vy = 0.0
         self.lost_frames = 0
@@ -132,7 +130,7 @@ class GazeState:
     point: Optional[Tuple[int, int]] = None
     is_fixation: bool = False
     calib_point: Optional[Tuple[int, int]] = None
-    calib_progress: float = 0.0  # Progress (point index + fraction)
+    calib_progress: float = 0.0  # Progress as float (point + fraction)
     calibrating: bool = True
     lock: threading.Lock = None
     
@@ -180,12 +178,14 @@ class Heatmap:
     
     @staticmethod
     def _make_kernel(size: int, sigma: float) -> np.ndarray:
+        """Create normalized 2D Gaussian kernel."""
         x = np.arange(size) - size // 2
         k1d = np.exp(-x**2 / (2 * sigma**2))
         k2d = np.outer(k1d, k1d)
         return (k2d / k2d.max()).astype(np.float32)
     
     def add(self, x: int, y: int, weight: float = 1.0):
+        """Add weighted Gaussian at (x, y)."""
         x = int(np.clip(x, 0, self.width - 1))
         y = int(np.clip(y, 0, self.height - 1))
         
@@ -197,51 +197,38 @@ class Heatmap:
         self.data[y1:y2, x1:x2] += self._kernel[ky1:ky2, kx1:kx2] * weight
     
     def decay(self):
+        """Apply exponential decay."""
         self.data *= HEATMAP_DECAY
     
     def get_peaks(self, max_count: int = 10) -> List[Tuple[int, int, float]]:
-        """Find peaks via non-max suppression. Returns [(x, flipped_y, intensity)]."""
+        """Find local maxima using NMS. Returns [(x, y_cocoa, intensity)]."""
         max_val = self.data.max()
         if max_val < PEAK_THRESHOLD:
             return []
         
-        # Downsample for speed
         scale = 4
-        small = cv2.resize(self.data, (self.width // scale, self.height // scale), 
-                          interpolation=cv2.INTER_AREA)
+        small = cv2.resize(self.data, (self.width // scale, self.height // scale),
+                           interpolation=cv2.INTER_AREA)
         
-        # Pixel must equal the neighborhood max
-        kernel_size = max(3, PEAK_MIN_DISTANCE // scale)
-        if kernel_size % 2 == 0:
-            kernel_size += 1
+        kernel_size = max(3, PEAK_MIN_DISTANCE // scale) | 1
         dilated = cv2.dilate(small, np.ones((kernel_size, kernel_size)))
         local_max = (small == dilated) & (small > PEAK_THRESHOLD)
         
-        # Collect peak coordinates
         ys, xs = np.where(local_max)
         if len(xs) == 0:
             return []
         
-        # Sort peaks by intensity
         intensities = small[ys, xs]
         order = np.argsort(-intensities)
         
-        # Enforce spacing between peaks
         peaks = []
-        min_dist_sq = (PEAK_MIN_DISTANCE // scale) ** 2
+        min_dist_sq = PEAK_MIN_DISTANCE ** 2
         
         for idx in order:
             px, py = int(xs[idx] * scale), int(ys[idx] * scale)
             intensity = float(intensities[idx] / max_val)
             
-            # Skip peaks too close to ones kept already
-            too_close = False
-            for ex, ey, _ in peaks:
-                if (px - ex) ** 2 + (py - ey) ** 2 < min_dist_sq * scale * scale:
-                    too_close = True
-                    break
-            
-            if not too_close:
+            if not any((px - ex)**2 + (py - ey)**2 < min_dist_sq for ex, ey, _ in peaks):
                 peaks.append((px, self.height - py, intensity))
                 if len(peaks) >= max_count:
                     break
@@ -249,13 +236,18 @@ class Heatmap:
         return peaks
     
     def get_rois(self) -> List[dict]:
-        """Return ROI dicts (center, radius, weight) for mask generation."""
-        peaks = self.get_peaks()
-        return [{"center": [x, self.height - (self.height - y)], 
-                 "radius": int(HEATMAP_SIGMA * 2 * intensity + 50),
-                 "weight": intensity} for x, y, intensity in peaks]
+        """Get ROIs for mask generation."""
+        return [
+            {"center": [x, y], "radius": int(HEATMAP_SIGMA * 2 * w + 50), "weight": w}
+            for x, y, w in self.get_peaks()
+        ]
+    
+    def snapshot(self) -> np.ndarray:
+        """Return copy of current heatmap data."""
+        return self.data.copy()
     
     def clear(self):
+        """Reset heatmap to zero."""
         self.data.fill(0)
 
 
@@ -275,7 +267,7 @@ class OverlayView(NSView):
         return self
     
     def setData_fixation_calib_peaks_progress_(self, gaze, fixation, calib, peaks, progress):
-        """Update view state; ObjC name avoids NSView.update clash."""
+        """Update view state. Uses ObjC naming to avoid NSView.update conflict."""
         self._heat_peaks = peaks or []
         self._calib = calib
         self._calib_progress = progress
@@ -303,7 +295,7 @@ class OverlayView(NSView):
                 continue
             r, g, b = self._heat_color(intensity)
             
-            # Stack concentric circles for smooth falloff
+            # Draw 4 concentric circles for smooth falloff
             base_radius = 35 + intensity * 65
             for i in range(4, 0, -1):
                 alpha = intensity * (i / 4) * 0.4
@@ -316,19 +308,19 @@ class OverlayView(NSView):
     def _heat_color(t: float) -> Tuple[float, float, float]:
         """Smooth gradient: blue -> cyan -> green -> yellow -> orange -> red."""
         t = max(0.0, min(1.0, t))
-        if t < 0.2:  # Blue->Cyan
+        if t < 0.2:  # Blue to Cyan
             p = t / 0.2
             return (0.0, p * 0.8, 1.0)
-        elif t < 0.4:  # Cyan->Green
+        elif t < 0.4:  # Cyan to Green
             p = (t - 0.2) / 0.2
             return (0.0, 0.8 + p * 0.2, 1.0 - p)
-        elif t < 0.6:  # Green->Yellow
+        elif t < 0.6:  # Green to Yellow
             p = (t - 0.4) / 0.2
             return (p, 1.0, 0.0)
-        elif t < 0.8:  # Yellow->Orange
+        elif t < 0.8:  # Yellow to Orange
             p = (t - 0.6) / 0.2
             return (1.0, 1.0 - p * 0.35, 0.0)
-        else:  # Orange->Red
+        else:  # Orange to Red
             p = (t - 0.8) / 0.2
             return (1.0, 0.65 - p * 0.65, 0.0)
     
@@ -337,27 +329,27 @@ class OverlayView(NSView):
         frame = self.frame()
         screen_w, screen_h = frame.size.width, frame.size.height
         
-        # Overall progress bar near top
+        # Overall progress bar at top of screen
         bar_width = 300
         bar_height = 8
         bar_x = (screen_w - bar_width) / 2
-        bar_y = screen_h - 60  # Top offset in Cocoa coords
+        bar_y = screen_h - 60  # Near top in Cocoa coords
         
         overall_progress = self._calib_progress / CALIBRATION_POINTS
         
-        # Bar background fill
+        # Bar background
         Quartz.CGContextSetRGBFillColor(ctx, 0.2, 0.2, 0.3, 0.8)
         Quartz.CGContextFillRect(ctx, Quartz.CGRectMake(bar_x - 2, bar_y - 2, bar_width + 4, bar_height + 4))
         
-        # Bar progress fill
+        # Bar fill
         Quartz.CGContextSetRGBFillColor(ctx, 0.3, 0.8, 0.5, 0.9)
         Quartz.CGContextFillRect(ctx, Quartz.CGRectMake(bar_x, bar_y, bar_width * overall_progress, bar_height))
         
-        # Outer target halo
+        # Target circle background
         Quartz.CGContextSetRGBFillColor(ctx, 0.2, 0.1, 0.4, 0.7)
         Quartz.CGContextFillEllipseInRect(ctx, Quartz.CGRectMake(x - 45, y - 45, 90, 90))
         
-        # Progress ring for current target
+        # Progress ring for current point
         point_progress = self._calib_progress % 1.0
         if point_progress > 0:
             Quartz.CGContextSetRGBStrokeColor(ctx, 0.3, 1.0, 0.5, 0.9)
@@ -367,11 +359,11 @@ class OverlayView(NSView):
             Quartz.CGContextAddArc(ctx, x, y, 35, start_angle, end_angle, 1)
             Quartz.CGContextStrokePath(ctx)
         
-        # Inner target ring
+        # Inner target
         Quartz.CGContextSetRGBFillColor(ctx, 0.5, 0.3, 1.0, 0.9)
         Quartz.CGContextFillEllipseInRect(ctx, Quartz.CGRectMake(x - 20, y - 20, 40, 40))
         
-        # Target center
+        # Center dot
         Quartz.CGContextSetRGBFillColor(ctx, 1.0, 1.0, 1.0, 1.0)
         Quartz.CGContextFillEllipseInRect(ctx, Quartz.CGRectMake(x - 5, y - 5, 10, 10))
     
@@ -424,25 +416,20 @@ class GazeTracker:
         self.running = False
     
     def recalibrate(self):
-        """Flag recalibration for the tracking thread."""
+        """Request recalibration - will be picked up by tracking thread."""
         self._recalibrate = True
     
     def _setup_calibration(self, gestures):
-        """Setup calibration grid and reset state."""
+        """Initialize calibration grid and reset tracking state."""
         xx, yy = np.meshgrid(CALIBRATION_GRID, CALIBRATION_GRID)
         calib_map = np.column_stack([xx.ravel(), yy.ravel()])
         np.random.shuffle(calib_map)
         gestures.uploadCalibrationMap(calib_map, context="overlay")
         gestures.setFixation(0.7)
-        
-        # Reset library state
         gestures.reset(context="overlay")
         
-        # Force head tracking reset next frame
         gestures.starting_head_position = np.zeros((1, 2))
         gestures.starting_size = np.zeros((1, 2))
-        
-        # Mark averaging buffer full so our smoothing takes over
         gestures.filled_points["overlay"] = 20
         gestures.average_points["overlay"] = np.zeros((20, 2))
         
@@ -451,7 +438,7 @@ class GazeTracker:
         self._prev_calib = (0, 0)
         self._smoother.reset()
         self.heatmap.clear()
-        print(f"Calibration: {CALIBRATION_POINTS} points, {SAMPLES_PER_POINT} samples each. Look at the dots.")
+        print(f"Calibration: {CALIBRATION_POINTS} points, {SAMPLES_PER_POINT} samples each.")
     
     def _run(self):
         global _recalibrate_requested
@@ -459,7 +446,6 @@ class GazeTracker:
         gestures = EyeGestures_v3()
         self._gestures = gestures
         
-        # Patch MediaPipe defaults for stability
         try:
             import mediapipe as mp
             gestures.finder.mp_face_mesh = mp.solutions.face_mesh.FaceMesh(
@@ -470,13 +456,12 @@ class GazeTracker:
                 min_tracking_confidence=MIN_TRACKING_CONFIDENCE,
             )
         except Exception as e:
-            print(f"MediaPipe patch failed: {e}")
+            print(f"MediaPipe init failed: {e}")
         
         cap = VideoCapture(self.camera)
         self._setup_calibration(gestures)
         
         while self.running:
-            # Handle recalibration flags
             if self._recalibrate or _recalibrate_requested:
                 self._recalibrate = False
                 _recalibrate_requested = False
@@ -493,10 +478,8 @@ class GazeTracker:
             need_calib = self._calib_count < CALIBRATION_POINTS
             event, cevent = gestures.step(frame, need_calib, self.width, self.height, context="overlay")
             
-            # Handle missing tracking
             if event is None:
-                last_pos = self._smoother.mark_lost()
-                if last_pos is None:
+                if self._smoother.mark_lost() is None:
                     self.state.clear_gaze()
                 time.sleep(0.01)
                 continue
@@ -504,9 +487,7 @@ class GazeTracker:
             if need_calib and cevent:
                 px, py = int(cevent.point[0]), int(cevent.point[1])
                 
-                # Count samples for current target
                 if (px, py) != self._prev_calib:
-                    # New target detected
                     if self._samples_at_point >= SAMPLES_PER_POINT:
                         self._calib_count += 1
                     self._samples_at_point = 0
@@ -514,22 +495,13 @@ class GazeTracker:
                 else:
                     self._samples_at_point += 1
                 
-                # Update calibration progress display
                 progress = self._calib_count + min(1.0, self._samples_at_point / SAMPLES_PER_POINT)
                 self.state.update_calibration((px, self.height - py), progress)
                 self._smoother.reset()
             else:
-                raw_x, raw_y = event.point[0], event.point[1]
-                
-                # Apply custom smoothing (library smoothing off)
-                sx, sy = self._smoother.update(raw_x, raw_y)
-                sy_cocoa = self.height - sy
-                
-                self.state.update_gaze((sx, sy_cocoa), event.fixation > 0.5)
-                
-                # Accumulate heatmap
-                weight = 0.5 if event.fixation > 0.5 else 0.15
-                self.heatmap.add(sx, sy, weight)
+                sx, sy = self._smoother.update(event.point[0], event.point[1])
+                self.state.update_gaze((sx, self.height - sy), event.fixation > 0.5)
+                self.heatmap.add(sx, sy, 0.5 if event.fixation > 0.5 else 0.15)
             
             time.sleep(1 / FPS)
 
@@ -566,16 +538,17 @@ class App(NSObject):
         NSTimer.scheduledTimerWithTimeInterval_target_selector_userInfo_repeats_(
             1.0 / FPS, self, 'tick:', None, True)
         
-        print(f"Gaze overlay running. Press 'q' to recalibrate, Ctrl+C to quit.")
+        print(f"Gaze overlay running. Press 'Ctrl+Q' to recalibrate, Ctrl+C to quit.")
     
     def _setup_key_monitor(self):
-        """Global 'q' key monitor for recalibration."""
-        from AppKit import NSEvent, NSKeyDownMask
+        """Setup global key event monitor for 'Ctrl+Q' key."""
+        from AppKit import NSEvent, NSKeyDownMask, NSControlKeyMask
         
         def handler(event):
             global _recalibrate_requested
             chars = event.charactersIgnoringModifiers()
-            if chars and chars.lower() == 'q':
+            modifiers = event.modifierFlags()
+            if chars and chars.lower() == 'q' and (modifiers & NSControlKeyMask):
                 print("\nRecalibration requested...")
                 _recalibrate_requested = True
             return event
@@ -609,7 +582,7 @@ class App(NSObject):
         self.view.setNeedsDisplay_(True)
     
     def cleanup(self):
-        """Remove event monitor."""
+        """Cleanup event monitor."""
         if self._event_monitor:
             from AppKit import NSEvent
             NSEvent.removeMonitor_(self._event_monitor)
@@ -617,7 +590,7 @@ class App(NSObject):
 
 
 def _signal_handler(sig, frame):
-    """Graceful shutdown on signals."""
+    """Handle Ctrl+C gracefully."""
     global _app_delegate
     print("\nShutting down...")
     if _app_delegate:
@@ -637,7 +610,7 @@ def main():
     p.add_argument('--no-heatmap', action='store_true')
     args = p.parse_args()
     
-    # Register signal handlers
+    # Setup signal handler for Ctrl+C
     signal.signal(signal.SIGINT, _signal_handler)
     signal.signal(signal.SIGTERM, _signal_handler)
     
